@@ -11,26 +11,26 @@ Authors: Sudhanshu Srivastava and Faisal Aqlan, University of Louisville.
 
 ## Contents
 
-- `main.py` -- competition runner (SDK loop, dispatcher, full-payload move
+- `main.py`: competition runner (SDK loop, dispatcher, full-payload move
   logging). Reads the agent API key from `GLEE_API_KEY` or `../key.txt`.
-- `barg.py`, `nego.py`, `pers.py` -- the three family policies.
-- `targets.py` -- percentile ladders: static pool quantiles blended with
+- `barg.py`, `nego.py`, `pers.py`: the three family policies.
+- `targets.py`: percentile ladders: static pool quantiles blended with
   live competition quantiles (one-way ratchet where self-sampling applies).
-- `oppmodel.py` -- named-opponent book. `norm.py`, `safe.py`, `msgs.py` --
+- `oppmodel.py`: named-opponent book. `norm.py`, `safe.py`, `msgs.py` --
   helpers, guaranteed-valid fallbacks, message templates.
-- `var_cfg.py` -- ablation-variant switch (env `GLEE_VARIANT` in A/B/C).
-- `build_percentiles.py` -- rebuilds `analysis/percentiles.json` from the
+- `var_cfg.py`: ablation-variant switch (env `GLEE_VARIANT` in A/B/C).
+- `build_percentiles.py`: rebuilds `analysis/percentiles.json` from the
   public GLEE corpus (https://github.com/eilamshapira/GLEE, `Data/`).
 - `build_live_quantiles.py`, `harvest_results.py`, `collect_daemon.py`,
-  `collect_results.py` -- outcome collection and live-quantile refresh.
-- `replay_audit.py` -- the behavior audit: replays logged moves through the
+  `collect_results.py`: outcome collection and live-quantile refresh.
+- `replay_audit.py`: the behavior audit: replays logged moves through the
   frozen policy and reports exact-match, invariant, and rate statistics.
 - `analyze_targets.py`, `analyze_results.py`, `final_snapshot.py` --
   analysis and close-of-competition capture utilities.
-- `test_local.py` -- offline test suite over synthetic payloads.
+- `test_local.py`: offline test suite over synthetic payloads.
 - `ablation_extract.py`, `ablation_pool.py`, `ablation_live.py`,
   `ablation_sim.py`, `ablation_decomp.py`, `ablation_modeldep.py`,
-  `ablation_variant_a.py`, `ablation_floor.py`, `paper_numbers.py` -- the
+  `ablation_variant_a.py`, `ablation_floor.py`, `paper_numbers.py`: the
   camera-ready ablations (see below). `barg.py` carries the offline switch
   `ABLATE` ("clamp", "targets", "safe", "floor", "floor-safe"), which is
   empty in play, so the replay audit reproduces the logged moves exactly.

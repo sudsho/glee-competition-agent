@@ -55,7 +55,7 @@ def split_action(my_amount: float, money: float, me: str) -> dict:
 
 
 def opp_bucket(game: dict) -> str:
-    """'human' | 'agent' | 'hidden' — how to treat the opponent."""
+    """'human' | 'agent' | 'hidden': how to treat the opponent."""
     o = ((game.get("opponent") or {}).get("type") or "hidden").lower()
     if o in ("human", "agent"):
         return o
