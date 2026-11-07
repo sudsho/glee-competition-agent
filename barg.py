@@ -30,8 +30,27 @@ def _sched(t):
 RHO = 0.97           # per-round survival belief when the horizon is unknown
 D_PRIOR = 0.90       # prior on a hidden opponent discount
 CAP_GREED = 0.58     # accept any offer at/above this share of the pot
+GREED_MAX = 0.75     # ceiling on the pool-q90 greed cap
 GIVE_CAP = 0.55      # never offer the opponent more than this share early
 FLOORS = {"human": 0.37, "hidden": 0.32, "agent": 0.26}
+KEEP_LO, KEEP_HI = 0.52, 0.70   # clamp on the equilibrium demand
+KEEP_MAX = 0.80                 # ceiling on the pool-target demand
+CONT_LO, CONT_HI = 0.40, 0.70   # clamp on the equilibrium continuation
+HAIRCUT = 0.90                  # deal-risk haircut on the continuation
+
+# Offline ablation only (empty in play). "clamp" removes the pool-aware
+# clamp: the [0.52, 0.70] and [0.40, 0.70] bounds on equilibrium shares,
+# the pool-percentile targets with their 0.80 ceiling, the pool-percentile
+# and patient pool-median accept bars, and the greed cap. "targets" removes
+# only the pool-based parts of the clamp and keeps its bounds. "safe"
+# removes the empirical safeguards: opponent floors, give caps, opener and
+# dead-zone rules, the deal-risk haircut, the opponent book, and the early,
+# stagnation, and deep-round accept rules. Safeguards read the quantile
+# tables through `ladder`, clamp parts through `pool`, so the two switches
+# never overlap. Two flags probe the patient pool-median floor alone:
+# "floor" removes it, and "floor-safe" files it under the safeguards, so
+# "clamp" leaves it in place.
+ABLATE = set()
 
 
 def _deltas(state, me):
@@ -109,93 +128,105 @@ def bargaining_strategy(game: dict) -> dict:
 
     d_me_e = d_me if T is not None else d_me * RHO
     d_op_e = d_op if T is not None else d_op * RHO
-    ladder = targets.barg_ladder(me, d_me, d_op_known, T,
-                                 bool(state.get("complete_information")),
-                                 bool(state.get("messages_allowed")))
+    ladder = targets.barg_ladder(
+        me, d_me, d_op_known, T,
+        bool(state.get("complete_information")),
+        bool(state.get("messages_allowed")))
+    pool = None if ABLATE & {"clamp", "targets"} else ladder
 
     if va.get("type") == "offer":
         return _offer(game, state, va, me, M, t, T, d_me, d_op, d_me_e, d_op_e,
-                      bucket, hist, ladder)
+                      bucket, hist, pool)
     return _decide(game, state, me, M, t, T, d_me, d_op, d_op_e, d_me_e,
-                   ladder)
+                   ladder, pool)
 
 
 def _offer(game, state, va, me, M, t, T, d_me, d_op, d_me_e, d_op_e, bucket,
-           hist, ladder=None):
+           hist, pool=None):
     keep = _spe_keep(M, T, t, d_me_e, d_op_e)
+    clamp = "clamp" not in ABLATE
+    safe = "safe" not in ABLATE
     # Pool-aware clamp: the reference pool settles near 50/50, so even when
     # backward induction says the endgame belongs to the opponent, opening
     # below a majority stance is percentile suicide. Floors below cover the
     # rejection risk on the other side.
-    keep = min(max(keep, 0.52 * M), 0.70 * M)
-    if ladder is not None:
+    if clamp:
+        keep = min(max(keep, KEEP_LO * M), KEEP_HI * M)
+    if pool is not None:
         # Demand what realizes the scheduled pool percentile after my decay.
         lvl = _sched(t)
-        if d_me <= 0.85 and d_op >= 0.95 and lvl > 75:
+        if safe and d_me <= 0.85 and d_op >= 0.95 and lvl > 75:
             lvl = 75      # impatient vs patient: maximize round-1 acceptance
-        tgt = ladder.q(lvl)
+        tgt = pool.q(lvl)
         if tgt is not None:
             want = tgt * M / max(d_me ** (t - 1), 0.05)
-            keep = min(max(keep, want), 0.80 * M)
-    # Acceptance dead zone: asks with keep in (0.62, 0.70) get accepted ~9%
-    # of the time vs 35-42% at 0.55-0.60; only a patient hand with a real
-    # deadline can afford to fish there.
-    if 0.62 * M < keep < 0.70 * M and not (d_me >= d_op and T is not None):
-        keep = 0.60 * M
-    # Opener probe in the hardened pool: every ask at 0.55-0.68 has been
-    # rejected 775/775; the 0.48-0.54 band is untested and their counters
-    # are rigid regardless of our ask, so probing 0.52 risks nothing.
-    if t == 1 and d_me <= 0.95 and not state.get("complete_information"):
-        keep = min(keep, 0.52 * M)
-    if var_cfg.VARIANT == "A" and t == 1:
-        keep = min(keep, 0.50 * M)     # variant A: even-split opener probe
-    # Ported from the A-vs-B natural experiment (n=150-180/cell): an even
-    # split opener wins exactly where we decay and the opponent does not
-    # (CI vs patient: acceptance 37-58% at pct 64-84, vs 9-17% asking
-    # more) and in hidden-info d 0.9-0.95. d=1.0 and impatient-opponent
-    # openers keep the higher ask (B/current policy wins those).
-    if t == 1 and ((state.get("complete_information") and d_me <= 0.95
-                    and d_op >= 0.95)
-                   or (0.88 <= d_me <= 0.95
-                       and not state.get("complete_information"))):
-        keep = min(keep, 0.50 * M)
-    # After a rejected opener answered with a lowball counter, the pool's
-    # accepted-ask mass sits near 0.55: stop asking above it.
-    if t >= 3 and hist:
-        got = [offer_gain(h.get("offer") or {}, me) for h in hist
-               if norm_player(h.get("proposer")) == other(me)]
-        got = [x for x in got if x is not None]
-        if got and got[-1] <= 0.45 * M:
-            keep = min(keep, 0.55 * M)
+            keep = min(max(keep, want), KEEP_MAX * M)
+    if safe:
+        # Acceptance dead zone: on Aug 22, asks with keep in (0.62, 0.70)
+        # were accepted 19% of the time (361/1924) vs 38% (807/2126) at
+        # 0.55-0.60. Only a patient hand with a real deadline can afford to
+        # fish there.
+        if 0.62 * M < keep < 0.70 * M and not (d_me >= d_op and T is not None):
+            keep = 0.60 * M
+        # Opener probe with hidden information: cap the round-1 ask at 0.52.
+        # Hand-set and unswept. On Aug 22-23, 507/1334 round-1 asks at
+        # 0.55-0.68 in these cells were accepted.
+        if t == 1 and d_me <= 0.95 and not state.get("complete_information"):
+            keep = min(keep, 0.52 * M)
+        if var_cfg.VARIANT == "A" and t == 1:
+            keep = min(keep, 0.50 * M)     # variant A: even-split opener probe
+        # Ported from the arm A comparison (Aug 24-26): an even split opener
+        # wins where we decay and the opponent does not (complete info vs a
+        # patient opponent: round-1 acceptance 341/735 vs 232/1566 asking
+        # more) and with hidden info at d 0.88-0.95 (746/962 vs 1172/2017).
+        # d=1.0 and impatient-opponent openers keep the higher ask (the
+        # baseline policy wins those).
+        if t == 1 and ((state.get("complete_information") and d_me <= 0.95
+                        and d_op >= 0.95)
+                       or (0.88 <= d_me <= 0.95
+                           and not state.get("complete_information"))):
+            keep = min(keep, 0.50 * M)
+        # After a rejected opener answered with a lowball counter, the
+        # pool's accepted-ask mass sits near 0.55: stop asking above it.
+        if t >= 3 and hist:
+            got = [offer_gain(h.get("offer") or {}, me) for h in hist
+                   if norm_player(h.get("proposer")) == other(me)]
+            got = [x for x in got if x is not None]
+            if got and got[-1] <= 0.45 * M:
+                keep = min(keep, 0.55 * M)
     y = M - keep                                 # offered to the opponent
 
-    floor = FLOORS[bucket] * M
-    rej = _last_rejected_to_opp(hist, me)
-    if rej is not None:
-        # Concession speed by patience: a truly patient hand (>=0.97) inches
-        # and holds the 0.50 atom; a semi-impatient one (0.90-0.95) bleeds
-        # ~26-40th percentile by crawling while its own decay bites, so it
-        # concedes fast to the pool's 0.50 mass and closes.
-        if d_me >= 0.97:
-            step, cap_y = 0.025, (0.50 if t <= 5 else 0.55)
-        elif d_me >= 0.9:
-            step = 0.07
-            cap_y = 0.50 if t <= 4 else 0.55
-        else:
-            step, cap_y = 0.05, 0.55
-        floor = max(floor, min(rej + step * M, cap_y * M))
+    if not safe:
+        y = min(max(y, 0.0), M)
+    else:
+        floor = FLOORS[bucket] * M
+        rej = _last_rejected_to_opp(hist, me)
+        if rej is not None:
+            # Concession speed by patience: a truly patient hand (>=0.97)
+            # inches and holds the 0.50 atom; a semi-impatient one
+            # (0.90-0.95) bleeds ~26-40th percentile by crawling while its
+            # own decay bites, so it concedes fast to the pool's 0.50 mass
+            # and closes.
+            if d_me >= 0.97:
+                step, cap_y = 0.025, (0.50 if t <= 5 else 0.55)
+            elif d_me >= 0.9:
+                step = 0.07
+                cap_y = 0.50 if t <= 4 else 0.55
+            else:
+                step, cap_y = 0.05, 0.55
+            floor = max(floor, min(rej + step * M, cap_y * M))
 
-    give_cap = GIVE_CAP * M
-    if d_me <= 0.85 and d_op >= 0.95 and t >= 3:
-        give_cap = 0.70 * M          # badly impatient vs patient: close NOW
-    elif t >= 5 and d_me < d_op:  # I bleed faster: open the cap gradually
-        give_cap = min(0.68, GIVE_CAP + 0.03 * (t - 4)) * M
-    elif t >= 7:                  # time-based opening against stonewalls
-        give_cap = min(0.62, GIVE_CAP + 0.02 * (t - 6)) * M
-    elif T is None and t >= 12:  # unlimited-horizon stalemate: inch open
-        give_cap = min(0.62, GIVE_CAP + 0.01 * (t - 12)) * M
+        give_cap = GIVE_CAP * M
+        if d_me <= 0.85 and d_op >= 0.95 and t >= 3:
+            give_cap = 0.70 * M          # badly impatient vs patient: close NOW
+        elif t >= 5 and d_me < d_op:  # I bleed faster: open the cap gradually
+            give_cap = min(0.68, GIVE_CAP + 0.03 * (t - 4)) * M
+        elif t >= 7:                  # time-based opening against stonewalls
+            give_cap = min(0.62, GIVE_CAP + 0.02 * (t - 6)) * M
+        elif T is None and t >= 12:  # unlimited-horizon stalemate: inch open
+            give_cap = min(0.62, GIVE_CAP + 0.01 * (t - 12)) * M
 
-    y = min(max(y, floor), give_cap)
+        y = min(max(y, floor), give_cap)
     action = split_action(M - y, M, me)
 
     if allow_message(state, va):
@@ -207,7 +238,7 @@ def _offer(game, state, va, me, M, t, T, d_me, d_op, d_me_e, d_op_e, bucket,
 
 
 def _decide(game, state, me, M, t, T, d_me, d_op, d_op_e, d_me_e,
-            ladder=None):
+            ladder=None, pool=None):
     offered = offer_gain(state.get("last_offer") or {}, me)
     if offered is None:
         return {"decision": "accept"}
@@ -215,23 +246,25 @@ def _decide(game, state, me, M, t, T, d_me, d_op, d_op_e, d_me_e,
     if T is not None and t >= T:                 # last chance: anything beats 0
         return {"decision": "accept" if offered > 0 else "reject"}
 
+    clamp = "clamp" not in ABLATE
+    safe = "safe" not in ABLATE
     # Pool-percentile accept: if taking this now already realizes the
     # scheduled percentile of the reference pool, take it.
     realized = offered * (d_me ** (t - 1))
-    if ladder is not None:
-        tgt = ladder.q(_sched(t))
+    if pool is not None:
+        tgt = pool.q(_sched(t))
         if tgt is not None and realized >= tgt * M:
             return {"decision": "accept"}
+    if ladder is not None and safe:
         # Semi-impatient responder (0.90-0.95) facing a same-or-more-patient
         # opponent on a finite horizon: chasing q90 early cost 18-31 points
         # against the accept-the-opener counterfactual; take the pool median.
         known = bool(state.get("complete_information"))
         if (d_me <= 0.95 and t <= 4
                 and ((not known) or d_op >= d_me - 0.01)):
-            # Pool hardened Aug 22: 0/775 of our asks accepted since, so
-            # the opponent's early offer IS the deal. Take the median bar
-            # (capped at 0.45) on any horizon, and at round 1, where the
-            # offer is un-decayed, even the q25 bar beats waiting.
+            # Take the median bar (capped at 0.45) on any horizon, and at
+            # round 1, where the offer is un-decayed, even the q25 bar beats
+            # waiting.
             q50 = ladder.q(50)
             if q50 is not None and realized >= min(q50, 0.45) * M:
                 return {"decision": "accept"}
@@ -250,9 +283,9 @@ def _decide(game, state, me, M, t, T, d_me, d_op, d_op_e, d_me_e,
             if q25 is not None and realized >= q25 * M:
                 return {"decision": "accept"}
 
-    # Disclosed agents have accepted zero counters of ours since the pool
-    # hardened; their opener is the best un-decayed value we will ever see.
-    if t == 1 and d_me <= 0.95:
+    # Disclosed agents rarely accept our counters, so their opener is
+    # usually the best un-decayed value we will see.
+    if safe and t == 1 and d_me <= 0.95:
         prof = oppmodel.profile(game)
         floor_prof = prof.get("barg_accept_floor")
         if floor_prof is None and oppmodel.is_disclosed_agent(game):
@@ -261,60 +294,67 @@ def _decide(game, state, me, M, t, T, d_me, d_op, d_op_e, d_me_e,
             return {"decision": "accept"}
 
     keep_next = _spe_keep(M, T, t + 1, d_me_e, d_op_e)
-    keep_next = min(max(keep_next, 0.40 * M), 0.70 * M)
-    thr = 0.90 * d_me * keep_next                # deal-risk haircut
-    cap_greed = CAP_GREED
-    if ladder is not None:
-        q90 = ladder.q(90)
-        if q90 is not None:                      # hold out longer when the
-            cap_greed = max(CAP_GREED, min(q90, 0.75))   # pool's top does
-    thr = min(thr, cap_greed * M)
+    if clamp:
+        keep_next = min(max(keep_next, CONT_LO * M), CONT_HI * M)
+    thr = (HAIRCUT if safe else 1.0) * d_me * keep_next   # deal-risk haircut
+    if clamp:
+        cap_greed = CAP_GREED
+        if pool is not None:
+            q90 = pool.q(90)
+            if q90 is not None:                  # hold out longer when the
+                cap_greed = max(CAP_GREED, min(q90, GREED_MAX))   # pool's top does
+        thr = min(thr, cap_greed * M)
 
-    # No-progress detector: if the opponent's last two offers to me barely
-    # moved, take their standing demand early instead of bleeding decay
-    # (55% of our agreements were late caves at realized 0.35 vs their
-    # stagnant 0.43 standing offer).
     stagnant = False
-    if t >= 3 and d_me <= 0.95:
-        to_me = [offer_gain(h.get("offer") or {}, me)
-                 for h in (state.get("history") or [])
-                 if norm_player(h.get("proposer")) == other(me)]
-        to_me = [x for x in to_me if x is not None]
-        if len(to_me) >= 2 and (to_me[-1] - to_me[-2]) < 0.03 * M:
-            stagnant = True
-            thr = min(thr, 0.38 * M)
-    # Tail rescue: kill the round-8-plus crumb spiral before decay turns a
-    # standing 0.3M into a realized 0.05M at the opponent's final ultimatum.
-    if stagnant and d_me <= 0.95 and T is not None and t >= 5:
-        thr = min(thr, 0.30 * M)
-    if t >= 8 and d_me <= 0.95:
-        thr = min(thr, 0.25 * M)
+    if safe:
+        # No-progress detector: if the opponent's last two offers to me
+        # barely moved, take their standing demand early instead of
+        # bleeding decay (55% of our agreements were late caves at realized
+        # 0.35 vs their stagnant 0.43 standing offer).
+        if t >= 3 and d_me <= 0.95:
+            to_me = [offer_gain(h.get("offer") or {}, me)
+                     for h in (state.get("history") or [])
+                     if norm_player(h.get("proposer")) == other(me)]
+            to_me = [x for x in to_me if x is not None]
+            if len(to_me) >= 2 and (to_me[-1] - to_me[-2]) < 0.03 * M:
+                stagnant = True
+                thr = min(thr, 0.38 * M)
+        # Tail rescue: kill the round-8-plus crumb spiral before decay turns
+        # a standing 0.3M into a realized 0.05M at the opponent's final
+        # ultimatum.
+        if stagnant and d_me <= 0.95 and T is not None and t >= 5:
+            thr = min(thr, 0.30 * M)
+        if t >= 8 and d_me <= 0.95:
+            thr = min(thr, 0.25 * M)
 
-    # Deep rounds: inflation makes stalemates worthless, take real money.
-    if t >= 6:
-        thr = min(thr, 0.40 * M)
-    if t >= 9:
-        thr = min(thr, 0.28 * M)
-    if t >= 12:
-        thr = min(thr, 0.15 * M)
+        # Deep rounds: inflation makes stalemates worthless, take real money.
+        if t >= 6:
+            thr = min(thr, 0.40 * M)
+        if t >= 9:
+            thr = min(thr, 0.28 * M)
+        if t >= 12:
+            thr = min(thr, 0.15 * M)
 
     # Patient-side pool floor: with essentially no decay, never accept
     # below the pool's central mass (atom at 0.50) in early-mid rounds.
     # Gated at 0.97: applying it to 0.90-0.95 hands forced rejections whose
     # decayed eventual settlements landed 18-31 points below the opener.
-    if (ladder is not None and d_me >= 0.97 and not stagnant
+    floor_src = pool if "floor-safe" not in ABLATE else (ladder if safe else None)
+    if "floor" in ABLATE:
+        floor_src = None
+    if (floor_src is not None and d_me >= 0.97 and not stagnant
             and t <= (8 if d_me >= 0.99 else 4)
             and (T is None or t <= T - 2)):
-        qf = ladder.q(50)
+        qf = floor_src.q(50)
         if qf is not None:
             thr = max(thr, min(qf * M / max(d_me ** (t - 1), 0.05),
                                0.55 * M))
 
     # Stonewall salvage: a game this deep is already lost on percentile;
     # crumbs beat zero and the concurrency slot is worth more than pride.
-    if t >= 25:
+    if safe and t >= 25:
         thr = min(thr, 0.03 * M)
-    if t >= 40:
+    if safe and t >= 40:
         thr = min(thr, 1e-9)
 
     return {"decision": "accept" if offered >= thr else "reject"}

@@ -281,7 +281,7 @@ def _decision(game, state, va, seller, myv, oppv, reserve_hat, M, t, T,
         # Hold for the final-counter gambit: when our counter will become
         # the round-T offer (parity: T-1-t even) in an alive complete-info
         # game, no earlier accept path may fire below the gambit share.
-        # Measured close rate of the gambit: 251/263 (95.4%) at pct ~94.
+        # Season close rate of the gambit: 670/738 (90.8%).
         zopa_signed = ((oppv - myv) if seller else (myv - oppv)) \
             if oppv is not None else None
         hold = (T is not None and zopa_signed is not None and zopa_signed > 0
@@ -317,9 +317,10 @@ def _decision(game, state, va, seller, myv, oppv, reserve_hat, M, t, T,
         need = max(0.45 if T is None else 0.30, 0.75 - 0.05 * (t - 1))
         if T is not None and t >= T - 1:
             # Final-counter gambit (complete info): the decider at T-1
-            # proposes at T, and a thin-margin close there has been accepted
-            # 10/10 times ever fired. Fall through to reject-and-counter
-            # unless the standing offer already gives us most of the ZOPA.
+            # proposes at T, and a thin-margin close there was accepted
+            # 10/10 times when adopted (670/738 over the season). Fall
+            # through to reject-and-counter unless the standing offer
+            # already gives us most of the ZOPA.
             gambit = (zopa is not None and t == T - 1 and not stonewaller
                       and surplus < GAMBIT_FRAC * zopa)
             if not gambit:

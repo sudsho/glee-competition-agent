@@ -1,2 +1,4 @@
 glee-sdk>=0.0.5
 requests
+numpy
+scipy
